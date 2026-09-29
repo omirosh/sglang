@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import triton
 
+from sglang.srt.layers.attention.verify_seqused_k import fill_stable_seqused_k
+
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -345,6 +347,11 @@ class AiterAttnBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int64, device=model_runner.device
         )
         self._kv_indices_scratch: Optional[torch.Tensor] = None
+        # One seq_lens+max_q_len buffer per forward. A new tensor per layer
+        # misses vattn_asm's plan cache, which keys on data_ptr.
+        self._verify_seqused_k_buf: Optional[torch.Tensor] = None
+        self._verify_seqused_k_tensor: Optional[torch.Tensor] = None
+        self._verify_seqused_k_ready = False
 
         # Create prefill indices updater
         if not skip_prefill:
@@ -1383,12 +1390,27 @@ class AiterAttnBackend(AttentionBackend):
             return 1
         return kv_indices_num_token_blocks(self.req_to_token.shape[1], bs)
 
+    def _stable_verify_seqused_k(self, seq_lens: torch.Tensor, max_q_len: int) -> torch.Tensor:
+        """seq_lens + max_q_len, same storage for every layer of this forward.
+
+        The add stays inside the captured region (first layer records copy_
+        and add_). Later layers reuse the buffer so the plan cache hits.
+        """
+        if self._verify_seqused_k_ready:
+            return self._verify_seqused_k_tensor
+        buf, out = fill_stable_seqused_k(self._verify_seqused_k_buf, seq_lens, max_q_len)
+        self._verify_seqused_k_buf = buf
+        self._verify_seqused_k_tensor = out
+        self._verify_seqused_k_ready = True
+        return out
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
         reset_verify_attn_plan_cache()
+        self._verify_seqused_k_ready = False
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1428,6 +1450,7 @@ class AiterAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
         reset_verify_attn_plan_cache()
+        self._verify_seqused_k_ready = False
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
@@ -3292,8 +3315,9 @@ class AiterAttnBackend(AttentionBackend):
                             v=v_unified,
                             out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                             cu_seqlens_q=self.forward_metadata.qo_indptr,
-                            seqused_k=(
-                                forward_batch.seq_lens + self.forward_metadata.max_q_len
+                            seqused_k=self._stable_verify_seqused_k(
+                                forward_batch.seq_lens,
+                                self.forward_metadata.max_q_len,
                             ),
                             max_seqlen_q=self.forward_metadata.max_q_len,
                             max_seqlen_k=max_kv_len,
@@ -3314,17 +3338,17 @@ class AiterAttnBackend(AttentionBackend):
                     # signature num_query_heads_16/num_queries_per_kv_1). GQA head
                     # mapping here is identical to the proven decode path.
 
-                    # The seq_lens + draft_num add has to run INSIDE the graph
-                    # region; a host-side pre-add would allocate a new tensor
-                    # each replay and break the captured pointer.
+                    # Same stable buffer as the asm path. The add is recorded
+                    # once per forward inside the graph, not once per layer.
                     unified_attention(
                         q=q_unified,
                         k=k_unified,
                         v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
-                        seqused_k=(
-                            forward_batch.seq_lens + self.forward_metadata.max_q_len
+                        seqused_k=self._stable_verify_seqused_k(
+                            forward_batch.seq_lens,
+                            self.forward_metadata.max_q_len,
                         ),
                         max_seqlen_q=self.forward_metadata.max_q_len,
                         max_seqlen_k=max_kv_len,
