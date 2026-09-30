@@ -1269,7 +1269,8 @@ def gdn_replayssm_spec_decode(
     num_stages_flush: int = 2,
     nk_flush: int = 2,
     launch_mode: str = "both",
-    dot_precision: str = "tf32",
+    # Triton allows tf32 on HIP only for gfx942; gfx950 rejects it at compile.
+    dot_precision: str = "ieee" if torch.version.hip else "tf32",
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
