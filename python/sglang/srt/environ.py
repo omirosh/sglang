@@ -926,6 +926,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Comma-separated BF16 Qwen3.5/3.8 GDN projections ("in_proj_qkvz",
+    # "out_proj") to quantize to MXFP4 after loading. gfx95x with AITER only.
+    SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvStr("")
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
     SGLANG_AMD_USE_FLYDSL_MEGA_MOE = EnvBool(False)
