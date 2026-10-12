@@ -226,6 +226,95 @@ class GdnPreTest(CustomTestCase):
             self.assertTrue(torch.equal(f32[name], b16[name]), name)
         self.assertTrue(torch.equal(f32["rstate"].to(BF), b16["rstate"]))
 
+    def test_mxfp4_in_proj_qkvz_layout(self):
+        """K1 with an online-MXFP4 in_proj_qkvz (``AiterMxfp4OnlineLinearMethod``)
+        against the bf16 K1 on the dequantized weight. Only x's MXFP4 rounding
+        differs; a wrong weight or scale layout gives an unrelated output."""
+        import torch.nn.functional as F
+
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import gdn
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.layout import (
+            BA,
+            CONV,
+            CORE,
+            HD,
+            HIDDEN,
+            NV,
+            QKVZ,
+        )
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            AiterMxfp4OnlineLinearMethod,
+            _dequant_mxfp4_to_bf16,
+            _dynamic_mxfp4_quant_orig,
+        )
+
+        g = torch.Generator(device="cuda").manual_seed(2)
+
+        def rnd(*shape, scale=1.0, dtype=BF):
+            return (torch.randn(*shape, generator=g, device="cuda") * scale).to(dtype)
+
+        s, slots = 4, 8
+        w = {
+            "hidden": rnd(s, HIDDEN, scale=2.0),
+            "residual": rnd(s, HIDDEN, scale=2.0),
+            "ln_w": rnd(HIDDEN, scale=0.1),
+            "w_ba": rnd(BA, HIDDEN, scale=0.05),
+            "conv_w": rnd(CONV, 1, 4, scale=0.4),
+            "a_log": rnd(NV, scale=0.5, dtype=torch.float32),
+            "dt_bias": rnd(NV, scale=0.5),
+            "norm_w": (1 + rnd(HD, scale=0.1, dtype=torch.float32)).to(BF),
+        }
+        w_qkvz = rnd(QKVZ, HIDDEN, scale=0.02)
+        q, sc = _dynamic_mxfp4_quant_orig(w_qkvz)
+        w_ref = _dequant_mxfp4_to_bf16(q.view(torch.uint8), sc.view(torch.uint8))
+        lin = torch.nn.Module()
+        lin.weight = torch.nn.Parameter(w_qkvz, requires_grad=False)
+        AiterMxfp4OnlineLinearMethod.quantize_(lin)
+        conv = rnd(slots, CONV, 3)
+        state = rnd(slots, NV, HD, HD, scale=0.05, dtype=torch.float32)
+        idx = torch.tensor([1, 2, -1, 4], dtype=torch.int32, device="cuda")
+        out = {}
+        for qq in (False, True):
+            key = gdn.K1Build(tokens=s, qq=qq)
+            o = out[qq] = {
+                "conv": conv.clone(),
+                "rstate": state.clone(),
+                "core": torch.empty(s, CORE, dtype=BF, device="cuda"),
+                "res_out": torch.empty(s, HIDDEN, dtype=BF, device="cuda"),
+            }
+            gdn.gdn_pre(
+                key,
+                **w,
+                w_qkvz=lin.weight if qq else w_ref,
+                w_qkvzs=lin.weight_scale if qq else None,
+                res_out=o["res_out"],
+                conv_state=o["conv"],
+                rstate=o["rstate"],
+                st_idx=idx,
+                core=o["core"],
+                scratch=torch.zeros(
+                    gdn.scratch_bytes(key), dtype=torch.uint8, device="cuda"
+                ),
+                epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+                layer=0,
+            )
+        torch.cuda.synchronize()
+        ref, fp4 = out[False], out[True]
+        self.assertTrue(torch.equal(ref["res_out"], fp4["res_out"]))
+        rows, live = [0, 1, 3], idx[[0, 1, 3]].long()
+        for name, a, b in (
+            ("core", ref["core"][rows], fp4["core"][rows]),
+            ("conv", ref["conv"][live], fp4["conv"][live]),
+            (
+                "rstate",
+                ref["rstate"][live] - state[live],
+                fp4["rstate"][live] - state[live],
+            ),
+        ):
+            cos = F.cosine_similarity(a.float().flatten(), b.float().flatten(), 0)
+            self.assertGreater(cos.item(), 0.98, name)
+        self.assertTrue(torch.equal(fp4["core"][2], torch.zeros_like(fp4["core"][2])))
+
 
 if __name__ == "__main__":
     unittest.main()
