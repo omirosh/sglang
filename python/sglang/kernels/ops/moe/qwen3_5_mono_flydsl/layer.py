@@ -42,10 +42,10 @@ on it).
 
 Two variants follow the stock flags:
 
-- ``fse`` (``VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS``): the shared expert is
+- ``fse`` (``SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4``): the shared expert is
   expert 512 of w13 / w2, a pick of every token at top-k index 10 with weight
-  sigmoid(bf16(x . w_sg)) (fp32, the top-k kernel's fused sigmoid); no sgu
-  stage, no shared down rows.
+  sigmoid(x . w_sg) (fp32 logit and sigmoid, SGLang's fused append kernel); no
+  sgu stage, no shared down rows.
 - ``oq`` (an online-MXFP4 out_proj on the ASM FP4 GEMM): o_proj's weight is
   fp4x2 through ``shuffle_weight(layout=(16, 16))``, its scales through
   ``e8m0_shuffle``; the core rows go through MXFP4 (RCEIL), as
@@ -741,7 +741,8 @@ def stage_sgu(c, g, ops):
 def stage_sgate(c, t):
     """Token t's shared-expert gate: sigmoid(bf16(x . w_sg)) as bf16 -> SGATE
     (ReplicatedLinear then torch.sigmoid, both bf16 out); fused (``fse``), the
-    sigmoid stays fp32: the top-k kernel's on the combined gate's bf16 logit."""
+    logit and the sigmoid stay fp32, as SGLang's fused append kernel
+    (``_fused_append_shared_experts_with_weights_kernel``, ``fuse_gate``)."""
     tid, lane, wave, red = c["tid"], c["lane"], c["wave"], c["red"]
     a = c["args"]
     wait_x(c, HIDDEN, 0)
@@ -768,8 +769,8 @@ def stage_sgate(c, t):
         tot = fx.ptr_load(red + 0)
         for w in range_constexpr(1, WAVES):
             tot = tot + fx.ptr_load(red + w)
-        g = sigmoid(bf16_round(tot))
-        c["put"](c["sgate"], t, g if c["fse"] else bf16_round(g))
+        g = sigmoid(tot) if c["fse"] else bf16_round(sigmoid(bf16_round(tot)))
+        c["put"](c["sgate"], t, g)
     gpu.barrier()
 
 

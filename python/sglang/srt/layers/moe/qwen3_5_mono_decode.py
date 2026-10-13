@@ -13,9 +13,10 @@ two persistent launches:
   layer runs SGLang's attention up to o_proj's input, then K2.
 
 The decode CUDA graph captures the step per batch size; any other step takes
-the stock layers. Needs the shared expert unfused
-(``--disable-shared-experts-fusion``). K1 also needs an fp32 or bf16 SSM
-state and no ReplaySSM ring.
+the stock layers. The shared expert is unfused
+(``--disable-shared-experts-fusion``) or MXFP4 expert 512 of the routed
+experts (``SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4``, K2's ``fse``). K1 also
+needs an fp32 or bf16 SSM state and no ReplaySSM ring.
 
 With speculative decoding, a target-verify step of at most ``MAX_TOKENS``
 rows (batch x draft tokens) runs K2 only: K1 writes no per-draft-token state
@@ -89,8 +90,11 @@ def _unsupported(model) -> str | None:
         mlp = layer.mlp
         if not isinstance(mlp, Qwen2MoeSparseMoeBlock):
             return "dense MLP"
-        if mlp.num_fused_shared_experts or mlp.shared_expert is None:
-            return "fused shared expert (use --disable-shared-experts-fusion)"
+        fused = mlp.num_fused_shared_experts
+        if fused not in (0, 1) or (mlp.shared_expert is None) != bool(fused):
+            return f"{fused} fused shared experts"
+        if bool(fused) != bool(model.layers[0].mlp.num_fused_shared_experts):
+            return "shared expert fused on some layers only"
         if _is_gdn(layer):
             a = layer.linear_attn
             gdn = (
@@ -124,6 +128,7 @@ class MonoDecode:
         if not self.ok:
             logger.info("Qwen3.8 mono decode off: %s", why)
             return
+        self.fse = bool(model.layers[0].mlp.num_fused_shared_experts)
         dev = model.embed_tokens.weight.device
 
         def buf(n: int) -> torch.Tensor:
@@ -140,7 +145,8 @@ class MonoDecode:
             for s in widths
         }
         self.k2_scratch = {
-            s: buf(layer.scratch_bytes(layer.K2Build(tokens=s))) for s in widths
+            s: buf(layer.scratch_bytes(layer.K2Build(tokens=s, fse=self.fse)))
+            for s in widths
         }
         self.epoch = torch.zeros(1, dtype=torch.int32, device=dev)
         tp = get_tp_group()
@@ -155,9 +161,10 @@ class MonoDecode:
         )
         self.peers.bytes.zero_()
         logger.info(
-            "Qwen3.8 mono decode on for %s steps of <= %d rows",
+            "Qwen3.8 mono decode on for %s steps of <= %d rows, shared expert %s",
             "decode" if self.k1 else "target-verify (K2 only)",
             L.MAX_TOKENS,
+            "fused" if self.fse else "unfused",
         )
 
     def _runtime_unsupported(self, forward_batch) -> str | None:
@@ -169,7 +176,7 @@ class MonoDecode:
             ex = mlp.experts
             if not getattr(ex.w13_weight, "is_shuffled", False):
                 return "routed experts not shuffled (needs aiter on gfx950)"
-            if ex.w13_weight.shape != (L.E, 2 * L.RI, L.HIDDEN // 2):
+            if ex.w13_weight.shape != (L.E + self.fse, 2 * L.RI, L.HIDDEN // 2):
                 return f"w13 shape {tuple(ex.w13_weight.shape)} (EP or padding)"
             if ex.w13_weight.dtype != torch.uint8 or ex.w2_weight.dtype != torch.uint8:
                 return "routed experts not MXFP4"
@@ -209,9 +216,12 @@ class MonoDecode:
                 layer.post_attention_layernorm.weight,
                 mlp.gate.weight,
                 mlp.shared_expert_gate.weight,
-                mlp.shared_expert.gate_up_proj.weight,
-                mlp.shared_expert.down_proj.weight,
             )
+            if not self.fse:
+                dense += (
+                    mlp.shared_expert.gate_up_proj.weight,
+                    mlp.shared_expert.down_proj.weight,
+                )
             if any(w.dtype != bf for w in dense):
                 return f"layer {layer.layer_id}: a dense weight is not bf16"
             if w_o.shape != (L.HIDDEN, L.CORE):
@@ -329,6 +339,7 @@ class MonoDecode:
 
         mlp = layer.mlp
         ex = mlp.experts
+        se = mlp.shared_expert
         w_o = (
             layer.linear_attn.out_proj.weight if _is_gdn(layer) else layer.o_proj.weight
         )
@@ -339,6 +350,7 @@ class MonoDecode:
             k2.K2Build(
                 tokens=s,
                 eps=layer.post_attention_layernorm.variance_epsilon,
+                fse=self.fse,
             ),
             core=core,
             residual=residual,
@@ -346,8 +358,8 @@ class MonoDecode:
             ln_w=layer.post_attention_layernorm.weight,
             w_gate=mlp.gate.weight,
             w_sg=mlp.shared_expert_gate.weight,
-            w_sgu=mlp.shared_expert.gate_up_proj.weight,
-            w_sd=mlp.shared_expert.down_proj.weight,
+            w_sgu=None if se is None else se.gate_up_proj.weight,
+            w_sd=None if se is None else se.down_proj.weight,
             w13=ex.w13_weight,
             w13s=ex.w13_weight_scale,
             w2=ex.w2_weight,

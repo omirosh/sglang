@@ -9,7 +9,8 @@ grouped an expert's partial sums by the expert's rank in the step's union.
 
 ``K1Test`` runs K1 (``gdn_pre``) on one GPU: core, res_out and the probe's
 conv / SSM state. ``K2Test`` runs K2 (``layer_post``) on 8 GPUs with random
-TP shards: out and res_out on every rank.
+TP shards: out and res_out on every rank, with the shared expert unfused and
+fused as expert 512 (``fse``).
 
 Run directly with ``python test/registered/amd/test_qwen3_5_mono_batch_invariance.py``;
 ``K2Test`` needs 8 GPUs.
@@ -174,7 +175,7 @@ class K1Test(CustomTestCase):
         self.assertEqual(with_width, [], "the probe changes with the width")
 
 
-def _worker_k2(rank, port, results):
+def _worker_k2(rank, port, results, fse):
     torch.cuda.set_device(rank)
     dev = torch.device("cuda", rank)
     dist.init_process_group(
@@ -208,15 +209,17 @@ def _worker_k2(rank, port, results):
 
         # This rank's shards; random fp4 bytes, e8m0 scales near 2^-8.
         g.manual_seed(100 + rank)
+        ne = E + fse
         w = {
             "w_o": rnd(HIDDEN, CORE, scale=0.02),
-            "w_sgu": rnd(2 * SI, HIDDEN, scale=0.02),
-            "w_sd": rnd(HIDDEN, SI, scale=0.02),
-            "w13": codes(E, 2 * RI, HIDDEN // 2),
-            "w13s": codes(E * 2 * RI * HIDDEN // 32, lo=117, hi=121),
-            "w2": codes(E, HIDDEN, RI // 2),
-            "w2s": codes(E * HIDDEN * RI // 32, lo=117, hi=121),
+            "w13": codes(ne, 2 * RI, HIDDEN // 2),
+            "w13s": codes(ne * 2 * RI * HIDDEN // 32, lo=117, hi=121),
+            "w2": codes(ne, HIDDEN, RI // 2),
+            "w2s": codes(ne * HIDDEN * RI // 32, lo=117, hi=121),
         }
+        if not fse:
+            w["w_sgu"] = rnd(2 * SI, HIDDEN, scale=0.02)
+            w["w_sd"] = rnd(HIDDEN, SI, scale=0.02)
         # Replicated weights and the residual: one seed on every rank.
         g.manual_seed(0)
         w["ln_w"] = rnd(HIDDEN, scale=0.1)
@@ -233,7 +236,9 @@ def _worker_k2(rank, port, results):
         epoch = torch.zeros(1, dtype=torch.int32, device=dev)
         scratch = {
             s: torch.zeros(
-                k2.scratch_bytes(k2.K2Build(tokens=s)), dtype=torch.uint8, device=dev
+                k2.scratch_bytes(k2.K2Build(tokens=s, fse=fse)),
+                dtype=torch.uint8,
+                device=dev,
             )
             for s in range(1, MAX_TOKENS + 1)
         }
@@ -241,7 +246,7 @@ def _worker_k2(rank, port, results):
         built = True
         try:
             for s in range(1, MAX_TOKENS + 1):
-                k2.build(k2.K2Build(tokens=s))
+                k2.build(k2.K2Build(tokens=s, fse=fse))
         except Exception:
             built = False
             raise
@@ -259,7 +264,7 @@ def _worker_k2(rank, port, results):
             res_out = torch.empty_like(out)
             epoch.add_(1)
             k2.layer_post(
-                k2.K2Build(tokens=s),
+                k2.K2Build(tokens=s, fse=fse),
                 core=core,
                 residual=residual,
                 **w,
@@ -299,8 +304,15 @@ class K2Test(CustomTestCase):
     def test_probe_row(self):
         if torch.cuda.device_count() < TP_SIZE:
             self.skipTest(f"needs {TP_SIZE} GPUs")
+        for fse in (False, True):
+            with self.subTest(fse=fse):
+                self._probe(fse)
+
+    def _probe(self, fse):
         results = mp.Manager().dict()
-        mp.spawn(_worker_k2, args=(_free_port(), results), nprocs=TP_SIZE, join=True)
+        mp.spawn(
+            _worker_k2, args=(_free_port(), results, fse), nprocs=TP_SIZE, join=True
+        )
         for rank in range(TP_SIZE):
             r = results.get(rank)
             self.assertIsNotNone(r, f"rank {rank} produced no result")
