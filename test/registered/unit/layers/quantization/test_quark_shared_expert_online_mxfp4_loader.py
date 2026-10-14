@@ -92,6 +92,9 @@ class _StubFusedMoE:
         use_presharded_weights: bool = False,
     ):
         self.moe_tp_size = moe_tp_size
+        # Set per load() call below, the way the real layer reads it out of
+        # get_parallel() once in __init__.
+        self.moe_tp_rank = 0
         self.use_padded_loading = use_padded_loading
         self.use_presharded_weights = use_presharded_weights
         self._has_fused_shared = has_fused_shared
@@ -144,13 +147,13 @@ class _StubFusedMoE:
         else:
             loaded = torch.ones(loaded_intermediate, HIDDEN, dtype=dtype)
             default_param, shard_dim = self.w13_weight, 0
+        self.moe_tp_rank = tp_rank
         return self._maybe_load_bf16_shared_expert_as_fp4(
             param=default_param if param is None else param,
             loaded_weight=loaded,
             shard_id=shard_id,
             expert_id=expert_id,
             shard_dim=shard_dim,
-            tp_rank=tp_rank,
         )
 
 
