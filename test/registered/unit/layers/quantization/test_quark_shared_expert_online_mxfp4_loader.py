@@ -10,12 +10,13 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
+    OCP_MX_BLOCK_SIZE as MX_BLOCK_SIZE,
+)
 from sglang.test.test_utils import CustomTestCase
 
-# Mirrors OCP_MX_BLOCK_SIZE, kept local so this test does not import the ROCm
-# scheme module. Both K dimensions and every per-rank intermediate below are
-# multiples of it, which is what create_weights enforces at startup.
-MX_BLOCK_SIZE = 32
+# Both K dimensions and every per-rank intermediate below are multiples of the
+# MX block size, which is what create_weights enforces at startup.
 
 HIDDEN = 64
 # Divisible by the widest TP size times the block size, so every rank's
@@ -134,6 +135,7 @@ class _StubFusedMoE:
         param=None,
         tp_rank=0,
     ):
+        self.moe_tp_rank = tp_rank
         # A presharded checkpoint already holds only this rank's slice; an
         # ordinary one holds the whole intermediate size on every rank.
         loaded_intermediate = (
@@ -147,7 +149,6 @@ class _StubFusedMoE:
         else:
             loaded = torch.ones(loaded_intermediate, HIDDEN, dtype=dtype)
             default_param, shard_dim = self.w13_weight, 0
-        self.moe_tp_rank = tp_rank
         return self._maybe_load_bf16_shared_expert_as_fp4(
             param=default_param if param is None else param,
             loaded_weight=loaded,
@@ -210,8 +211,8 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
         # The two buffers carry different byte patterns, so a scale written
         # into the weight buffer (or vice versa) shows up here.
         layer = _StubFusedMoE()
-        layer.load("w1")
-        layer.load("w2")
+        self.assertTrue(layer.load("w1"))
+        self.assertTrue(layer.load("w2"))
         for buf, offset in (
             (layer.w13_weight.data[SHARED_SLOT, :INTERMEDIATE], 0),
             (layer.w13_weight_scale.data[SHARED_SLOT, :INTERMEDIATE], 1000),
@@ -224,7 +225,7 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
     def test_routed_slots_are_left_alone(self):
         layer = _StubFusedMoE()
         for shard_id in ("w1", "w3", "w2"):
-            layer.load(shard_id)
+            self.assertTrue(layer.load(shard_id))
         for slot in range(NUM_LOCAL_ROUTED):
             self.assertTrue((layer.w13_weight.data[slot] == 0).all())
             self.assertTrue((layer.w13_weight_scale.data[slot] == 0).all())
@@ -241,12 +242,12 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
         full_scale = _fake_packed(HIDDEN, INTERMEDIATE // MX_BLOCK_SIZE, offset=1000)
         for tp_size in TP_SIZES:
             for tp_rank in range(tp_size):
-                layer = _StubFusedMoE(moe_tp_size=tp_size)
-                self.assertTrue(layer.load("w2", tp_rank=tp_rank))
-
-                weight_cols = layer.intermediate_per_partition // 2
-                scale_cols = layer.intermediate_per_partition // MX_BLOCK_SIZE
                 with self.subTest(tp_size=tp_size, tp_rank=tp_rank):
+                    layer = _StubFusedMoE(moe_tp_size=tp_size)
+                    self.assertTrue(layer.load("w2", tp_rank=tp_rank))
+
+                    weight_cols = layer.intermediate_per_partition // 2
+                    scale_cols = layer.intermediate_per_partition // MX_BLOCK_SIZE
                     torch.testing.assert_close(
                         layer.w2_weight.data[SHARED_SLOT],
                         full_weight[
@@ -273,8 +274,8 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
                 down, down_scale, gate = [], [], []
                 for tp_rank in range(tp_size):
                     layer = _StubFusedMoE(moe_tp_size=tp_size)
-                    layer.load("w2", tp_rank=tp_rank)
-                    layer.load("w1", tp_rank=tp_rank)
+                    self.assertTrue(layer.load("w2", tp_rank=tp_rank))
+                    self.assertTrue(layer.load("w1", tp_rank=tp_rank))
                     rows = layer.intermediate_per_partition
                     down.append(layer.w2_weight.data[SHARED_SLOT])
                     down_scale.append(layer.w2_weight_scale.data[SHARED_SLOT])
@@ -299,14 +300,14 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
         full = _fake_packed(INTERMEDIATE, HIDDEN // 2, offset=0)
         for tp_size in TP_SIZES:
             for tp_rank in range(tp_size):
-                layer = _StubFusedMoE(moe_tp_size=tp_size)
-                self.assertTrue(layer.load("w1", tp_rank=tp_rank))
-                self.assertTrue(layer.load("w3", tp_rank=tp_rank))
-
-                rows = layer.intermediate_per_partition
-                expected = full[rows * tp_rank : rows * (tp_rank + 1)]
-                weight = layer.w13_weight.data[SHARED_SLOT]
                 with self.subTest(tp_size=tp_size, tp_rank=tp_rank):
+                    layer = _StubFusedMoE(moe_tp_size=tp_size)
+                    self.assertTrue(layer.load("w1", tp_rank=tp_rank))
+                    self.assertTrue(layer.load("w3", tp_rank=tp_rank))
+
+                    rows = layer.intermediate_per_partition
+                    expected = full[rows * tp_rank : rows * (tp_rank + 1)]
+                    weight = layer.w13_weight.data[SHARED_SLOT]
                     torch.testing.assert_close(weight[:rows], expected)
                     torch.testing.assert_close(weight[rows:], expected)
 
@@ -314,13 +315,13 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
         # The checkpoint already holds this rank's slice, so narrowing it a
         # second time would silently keep only part of it.
         for tp_size in TP_SIZES:
-            layer = _StubFusedMoE(moe_tp_size=tp_size, use_presharded_weights=True)
-            last_rank = tp_size - 1
-            self.assertTrue(layer.load("w2", tp_rank=last_rank))
-            self.assertTrue(layer.load("w1", tp_rank=last_rank))
-
-            rows = layer.intermediate_per_partition
             with self.subTest(tp_size=tp_size):
+                layer = _StubFusedMoE(moe_tp_size=tp_size, use_presharded_weights=True)
+                last_rank = tp_size - 1
+                self.assertTrue(layer.load("w2", tp_rank=last_rank))
+                self.assertTrue(layer.load("w1", tp_rank=last_rank))
+
+                rows = layer.intermediate_per_partition
                 torch.testing.assert_close(
                     layer.w2_weight.data[SHARED_SLOT],
                     _fake_packed(HIDDEN, rows // 2, offset=0),
@@ -379,22 +380,38 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
             )
 
     def test_padding_and_tensor_parallelism_together(self):
-        # The shape the model of interest actually serves in: TP8 with aiter's
-        # padding on top. Each rank's slice goes in the leading part of its own
-        # padded band, and the pad after it stays zero.
+        # Padding and sharding combined: each rank's slice goes in the leading
+        # part of its own padded band, and the pad after it stays zero.
+        #
+        # Not the shape amd/Qwen3.8-2.4T-A95B-Quark-MXFP4 serves in. Its
+        # moe_intermediate_size is 2048, so TP8 gives 256 per rank and a
+        # w2_down_dim of 128, which is exactly AITER_PADDING_SIZE; aiter reports
+        # is_padded=False and the measured configuration carries no padding at
+        # all. Padding only appears at a TP size that leaves w2_down_dim short
+        # of 128, e.g. TP16.
+        #
+        # The padded buffer is driven through the plain leading-slice copy here,
+        # not through use_padded_loading. That combination is deliberate: when
+        # aiter really does pad it sets weight_padded on w2_weight, which makes
+        # FusedMoE.use_padded_loading true, and on that branch the checkpoint
+        # offset is shard_size * tp_rank with shard_size already padded. That
+        # mis-slices for tp_rank > 0 for the routed experts too, so it is
+        # pre-existing and out of scope here; it is also why a padded path at
+        # TP > 1 has no test. test_padded_loading_agrees_with_the_plain_path
+        # covers use_padded_loading at TP1, where the offset is zero.
         pad = MX_BLOCK_SIZE
         full_gate = _fake_packed(INTERMEDIATE, HIDDEN // 2, offset=0)
         full_down = _fake_packed(HIDDEN, INTERMEDIATE // 2, offset=0)
         for tp_rank in (0, 7):
-            layer = _StubFusedMoE(moe_tp_size=8, intermediate_pad=pad)
-            self.assertTrue(layer.load("w1", tp_rank=tp_rank))
-            self.assertTrue(layer.load("w2", tp_rank=tp_rank))
-
-            rows = layer.intermediate_per_partition
-            cols = rows // 2
-            weight = layer.w13_weight.data[SHARED_SLOT]
-            w2 = layer.w2_weight.data[SHARED_SLOT]
             with self.subTest(tp_rank=tp_rank):
+                layer = _StubFusedMoE(moe_tp_size=8, intermediate_pad=pad)
+                self.assertTrue(layer.load("w1", tp_rank=tp_rank))
+                self.assertTrue(layer.load("w2", tp_rank=tp_rank))
+
+                rows = layer.intermediate_per_partition
+                cols = rows // 2
+                weight = layer.w13_weight.data[SHARED_SLOT]
+                w2 = layer.w2_weight.data[SHARED_SLOT]
                 torch.testing.assert_close(
                     weight[:rows], full_gate[rows * tp_rank : rows * (tp_rank + 1)]
                 )
@@ -440,8 +457,8 @@ class TestSharedExpertOnlineMxfp4Loader(CustomTestCase):
         # happens afterwards, on the packed result. That is what makes a rank's
         # bytes match an offline-quantized checkpoint of the same shard.
         layer = _StubFusedMoE(moe_tp_size=8)
-        layer.load("w1", tp_rank=7)
-        layer.load("w2", tp_rank=7)
+        self.assertTrue(layer.load("w1", tp_rank=7))
+        self.assertTrue(layer.load("w2", tp_rank=7))
         self.assertEqual(
             layer.scheme.seen, [(INTERMEDIATE, HIDDEN), (HIDDEN, INTERMEDIATE)]
         )

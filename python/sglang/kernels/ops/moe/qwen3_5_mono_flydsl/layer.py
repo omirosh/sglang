@@ -42,7 +42,7 @@ on it).
 
 Two variants follow the stock flags:
 
-- ``fse`` (``SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4``): the shared expert is
+- ``fse`` (``--enforce-shared-experts-fusion``): the shared expert is
   expert 512 of w13 / w2, a pick of every token at top-k index 10 with weight
   sigmoid(x . w_sg) (fp32 logit and sigmoid, SGLang's fused append kernel); no
   sgu stage, no shared down rows.

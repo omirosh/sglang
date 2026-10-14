@@ -15,7 +15,7 @@ two persistent launches:
 The decode CUDA graph captures the step per batch size; any other step takes
 the stock layers. The shared expert is unfused
 (``--disable-shared-experts-fusion``) or MXFP4 expert 512 of the routed
-experts (``SGLANG_FUSE_SHARED_EXPERTS_ONLINE_MXFP4``, K2's ``fse``). K1 also
+experts (``--enforce-shared-experts-fusion``, K2's ``fse``). K1 also
 needs an fp32 or bf16 SSM state and no ReplaySSM ring.
 
 With speculative decoding, a target-verify step of at most ``MAX_TOKENS``
