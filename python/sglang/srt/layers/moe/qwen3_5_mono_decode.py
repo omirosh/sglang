@@ -18,6 +18,11 @@ the stock layers. The shared expert is unfused
 experts (``--enforce-shared-experts-fusion``, K2's ``fse``). K1 also
 needs an fp32 or bf16 SSM state and no ReplaySSM ring.
 
+A GDN in_proj_qkvz or out_proj quantized online by
+``SGLANG_ROCM_GDN_ONLINE_MXFP4`` (``AiterMxfp4OnlineLinearMethod``) is read in
+place as K1's ``qq`` / K2's ``oq``: its weight is ``shuffle_weight((16, 16))``
+and its scales ``shuffle_scale``, the layout those variants read.
+
 With speculative decoding, a target-verify step of at most ``MAX_TOKENS``
 rows (batch x draft tokens) runs K2 only: K1 writes no per-draft-token state
 for the rollback, so GDN layers run SGLang's ``linear_attn.core`` there.
@@ -53,6 +58,14 @@ def enabled() -> bool:
 
 def _is_gdn(layer) -> bool:
     return hasattr(layer, "linear_attn")
+
+
+def _mxfp4(linear) -> bool:
+    from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+        AiterMxfp4OnlineLinearMethod,
+    )
+
+    return isinstance(linear.quant_method, AiterMxfp4OnlineLinearMethod)
 
 
 def _unsupported(model) -> str | None:
@@ -138,8 +151,9 @@ class MonoDecode:
         self.k1_scratch = {
             s: buf(
                 max(
-                    gdn.scratch_bytes(gdn.K1Build(tokens=s, first=f))
+                    gdn.scratch_bytes(gdn.K1Build(tokens=s, first=f, qq=q))
                     for f in (False, True)
+                    for q in (False, True)
                 )
             )
             for s in widths
@@ -180,18 +194,17 @@ class MonoDecode:
                 return f"w13 shape {tuple(ex.w13_weight.shape)} (EP or padding)"
             if ex.w13_weight.dtype != torch.uint8 or ex.w2_weight.dtype != torch.uint8:
                 return "routed experts not MXFP4"
-            if _is_gdn(layer) and not self.k1:
-                w_o = layer.linear_attn.out_proj.weight
-                dense = (w_o,)
-            elif _is_gdn(layer):
+            o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
+            dense = () if _mxfp4(o) else (o.weight,)
+            if _is_gdn(layer) and self.k1:
                 a = layer.linear_attn
-                dense = (
-                    a.in_proj_qkvz.weight,
+                if not _mxfp4(a.in_proj_qkvz):
+                    dense += (a.in_proj_qkvz.weight,)
+                dense += (
                     a.in_proj_ba.weight,
                     a.conv1d.weight,
                     a.dt_bias,
                     a.norm.weight,
-                    a.out_proj.weight,
                 )
                 if a.A_log.dtype != torch.float32:
                     return "A_log not fp32"
@@ -207,10 +220,6 @@ class MonoDecode:
                     return f"conv state {tuple(st.conv[0].shape)} {st.conv[0].dtype}"
                 if not st.temporal[0].is_contiguous():
                     return "SSM state slot not dense"
-                w_o = a.out_proj.weight
-            else:
-                dense = (layer.o_proj.weight,)
-                w_o = layer.o_proj.weight
             dense += (
                 layer.input_layernorm.weight,
                 layer.post_attention_layernorm.weight,
@@ -224,8 +233,8 @@ class MonoDecode:
                 )
             if any(w.dtype != bf for w in dense):
                 return f"layer {layer.layer_id}: a dense weight is not bf16"
-            if w_o.shape != (L.HIDDEN, L.CORE):
-                return f"layer {layer.layer_id}: o_proj shape {tuple(w_o.shape)}"
+            if o.weight.shape != (L.HIDDEN, L.CORE // (2 if _mxfp4(o) else 1)):
+                return f"layer {layer.layer_id}: o_proj shape {tuple(o.weight.shape)}"
         return None
 
     def eligible(self, input_ids, forward_batch, input_embeds, pp_proxy_tensors):
@@ -261,6 +270,14 @@ class MonoDecode:
             why = self._runtime_unsupported(forward_batch)
             if why is not None:
                 logger.warning("Qwen3.8 mono decode off: %s", why)
+            else:
+                g = [x.linear_attn for x in self.model.layers if _is_gdn(x)]
+                logger.info(
+                    "Qwen3.8 mono decode MXFP4 GDN layers: in_proj_qkvz %d (K1 %s), out_proj %d",
+                    sum(_mxfp4(a.in_proj_qkvz) for a in g),
+                    "on" if self.k1 else "off",
+                    sum(_mxfp4(a.out_proj) for a in g),
+                )
             self._runtime_ok = why is None
         return self._runtime_ok
 
@@ -307,6 +324,7 @@ class MonoDecode:
 
         a = layer.linear_attn
         st = pool.mamba2_layer_cache(a.layer_id)
+        qq = _mxfp4(a.in_proj_qkvz)
         gdn.gdn_pre(
             gdn.K1Build(
                 tokens=h.size(0),
@@ -314,12 +332,14 @@ class MonoDecode:
                 eps=layer.input_layernorm.variance_epsilon,
                 norm_eps=a.norm.eps,
                 state_bf16=st.temporal.dtype == torch.bfloat16,
+                qq=qq,
             ),
             hidden=h,
             residual=residual,
             res_out=res_out,
             ln_w=layer.input_layernorm.weight,
             w_qkvz=a.in_proj_qkvz.weight,
+            w_qkvzs=a.in_proj_qkvz.weight_scale if qq else None,
             w_ba=a.in_proj_ba.weight,
             conv_w=a.conv1d.weight,
             conv_state=st.conv[0],
@@ -340,9 +360,8 @@ class MonoDecode:
         mlp = layer.mlp
         ex = mlp.experts
         se = mlp.shared_expert
-        w_o = (
-            layer.linear_attn.out_proj.weight if _is_gdn(layer) else layer.o_proj.weight
-        )
+        o = layer.linear_attn.out_proj if _is_gdn(layer) else layer.o_proj
+        oq = _mxfp4(o)
         s = core.size(0)
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
@@ -351,10 +370,12 @@ class MonoDecode:
                 tokens=s,
                 eps=layer.post_attention_layernorm.variance_epsilon,
                 fse=self.fse,
+                oq=oq,
             ),
             core=core,
             residual=residual,
-            w_o=w_o,
+            w_o=o.weight,
+            w_os=o.weight_scale if oq else None,
             ln_w=layer.post_attention_layernorm.weight,
             w_gate=mlp.gate.weight,
             w_sg=mlp.shared_expert_gate.weight,

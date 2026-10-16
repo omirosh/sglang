@@ -226,6 +226,80 @@ class GdnPreTest(CustomTestCase):
             self.assertTrue(torch.equal(f32[name], b16[name]), name)
         self.assertTrue(torch.equal(f32["rstate"].to(BF), b16["rstate"]))
 
+    def test_qq_reads_online_mxfp4_in_place(self):
+        """K1 ``qq`` on an in_proj_qkvz quantized by AiterMxfp4OnlineLinearMethod
+        against K1 on the same weight dequantized to bf16. Only the activation
+        goes through MXFP4 on one side; a misread weight or scale gives a
+        cosine near 0."""
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl import gdn
+        from sglang.kernels.ops.moe.qwen3_5_mono_flydsl.layout import (
+            BA,
+            CONV,
+            CORE,
+            HD,
+            HIDDEN,
+            NV,
+            QKVZ,
+        )
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            AiterMxfp4OnlineLinearMethod,
+            _dynamic_mxfp4_quant_orig,
+        )
+
+        g = torch.Generator(device="cuda").manual_seed(2)
+
+        def rnd(*shape, scale=1.0, dtype=BF):
+            return (torch.randn(*shape, generator=g, device="cuda") * scale).to(dtype)
+
+        s, slots = 4, 8
+        w_qkvz = rnd(QKVZ, HIDDEN, scale=0.02)
+        q, sc = (t.view(torch.uint8) for t in _dynamic_mxfp4_quant_orig(w_qkvz))
+        fp4 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+        lut = torch.tensor(fp4 + tuple(-v for v in fp4), device="cuda")
+        deq = torch.stack((lut[(q & 15).long()], lut[(q >> 4).long()]), -1)
+        deq = deq.view(QKVZ, HIDDEN // 32, 32) * torch.exp2(sc.float() - 127)[..., None]
+        lin = torch.nn.Module()
+        lin.weight = torch.nn.Parameter(w_qkvz, requires_grad=False)
+        AiterMxfp4OnlineLinearMethod.quantize_(lin)
+        w = {
+            "hidden": rnd(s, HIDDEN, scale=2.0),
+            "residual": rnd(s, HIDDEN, scale=2.0),
+            "ln_w": rnd(HIDDEN, scale=0.1),
+            "w_ba": rnd(BA, HIDDEN, scale=0.05),
+            "conv_w": rnd(CONV, 1, 4, scale=0.4),
+            "a_log": rnd(NV, scale=0.5, dtype=torch.float32),
+            "dt_bias": rnd(NV, scale=0.5),
+            "norm_w": (1 + rnd(HD, scale=0.1, dtype=torch.float32)).to(BF),
+        }
+        conv = rnd(slots, CONV, 3)
+        state = rnd(slots, NV, HD, HD, scale=0.05, dtype=torch.float32)
+        idx = torch.tensor([1, 2, -1, 4], dtype=torch.int32, device="cuda")
+        core = {}
+        for qq in (False, True):
+            key = gdn.K1Build(tokens=s, qq=qq)
+            core[qq] = torch.empty(s, CORE, dtype=BF, device="cuda")
+            gdn.gdn_pre(
+                key,
+                **w,
+                w_qkvz=lin.weight if qq else deq.reshape(QKVZ, HIDDEN).to(BF),
+                w_qkvzs=lin.weight_scale if qq else None,
+                res_out=torch.empty(s, HIDDEN, dtype=BF, device="cuda"),
+                conv_state=conv.clone(),
+                rstate=state.clone(),
+                st_idx=idx,
+                core=core[qq],
+                scratch=torch.zeros(
+                    gdn.scratch_bytes(key), dtype=torch.uint8, device="cuda"
+                ),
+                epoch=torch.ones(1, dtype=torch.int32, device="cuda"),
+                layer=0,
+            )
+        torch.cuda.synchronize()
+        live = idx > 0
+        a, b = (core[qq][live].float().flatten() for qq in (True, False))
+        self.assertTrue(torch.isfinite(a).all())
+        self.assertGreater(torch.nn.functional.cosine_similarity(a, b, dim=0).item(), 0.9)
+
 
 if __name__ == "__main__":
     unittest.main()
