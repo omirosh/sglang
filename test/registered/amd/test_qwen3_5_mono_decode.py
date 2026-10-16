@@ -243,6 +243,7 @@ class GdnPreTest(CustomTestCase):
         )
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
             AiterMxfp4OnlineLinearMethod,
+            _dequant_mxfp4_to_bf16,
             _dynamic_mxfp4_quant_orig,
         )
 
@@ -254,10 +255,7 @@ class GdnPreTest(CustomTestCase):
         s, slots = 4, 8
         w_qkvz = rnd(QKVZ, HIDDEN, scale=0.02)
         q, sc = (t.view(torch.uint8) for t in _dynamic_mxfp4_quant_orig(w_qkvz))
-        fp4 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-        lut = torch.tensor(fp4 + tuple(-v for v in fp4), device="cuda")
-        deq = torch.stack((lut[(q & 15).long()], lut[(q >> 4).long()]), -1)
-        deq = deq.view(QKVZ, HIDDEN // 32, 32) * torch.exp2(sc.float() - 127)[..., None]
+        deq = _dequant_mxfp4_to_bf16(q, sc.contiguous())
         lin = torch.nn.Module()
         lin.weight = torch.nn.Parameter(w_qkvz, requires_grad=False)
         AiterMxfp4OnlineLinearMethod.quantize_(lin)
@@ -281,7 +279,7 @@ class GdnPreTest(CustomTestCase):
             gdn.gdn_pre(
                 key,
                 **w,
-                w_qkvz=lin.weight if qq else deq.reshape(QKVZ, HIDDEN).to(BF),
+                w_qkvz=lin.weight if qq else deq,
                 w_qkvzs=lin.weight_scale if qq else None,
                 res_out=torch.empty(s, HIDDEN, dtype=BF, device="cuda"),
                 conv_state=conv.clone(),
