@@ -23,9 +23,10 @@ A GDN in_proj_qkvz or out_proj quantized online by
 place as K1's ``qq`` / K2's ``oq``: its weight is ``shuffle_weight((16, 16))``
 and its scales ``shuffle_scale``, the layout those variants read.
 
-With speculative decoding, a target-verify step of at most ``MAX_TOKENS``
+With speculative decoding, a target-verify step of at most 2 x ``MAX_TOKENS``
 rows (batch x draft tokens) runs K2 only: K1 writes no per-draft-token state
 for the rollback, so GDN layers run SGLang's ``linear_attn.core`` there.
+Above ``MAX_TOKENS`` rows K2 runs twice a layer, ``MAX_TOKENS`` rows first.
 
 The all-reduces run in-kernel over a peer buffer every TP rank maps. Mailbox
 tags carry a device epoch bumped once a step (captured with it), so no buffer
@@ -138,6 +139,7 @@ class MonoDecode:
         self._logged: set = set()
         # The target model runs no plain decode steps under speculative decoding.
         self.k1 = get_spec().speculative_algorithm is None
+        self.rows = L.MAX_TOKENS * (1 if self.k1 else 2)
         if not self.ok:
             logger.info("Qwen3.8 mono decode off: %s", why)
             return
@@ -177,7 +179,7 @@ class MonoDecode:
         logger.info(
             "Qwen3.8 mono decode on for %s steps of <= %d rows, shared expert %s",
             "decode" if self.k1 else "target-verify (K2 only)",
-            L.MAX_TOKENS,
+            self.rows,
             "fused" if self.fse else "unfused",
         )
 
@@ -238,11 +240,11 @@ class MonoDecode:
         return None
 
     def eligible(self, input_ids, forward_batch, input_embeds, pp_proxy_tensors):
-        """A decode step (K1 on) or a target-verify step (K1 off) of at most
-        ``MAX_TOKENS`` rows."""
+        """A decode step (K1 on) of at most ``MAX_TOKENS`` rows or a
+        target-verify step (K1 off) of at most ``self.rows``."""
         if not self.ok or input_embeds is not None or pp_proxy_tensors is not None:
             return False
-        if input_ids is None or not 1 <= input_ids.size(0) <= L.MAX_TOKENS:
+        if input_ids is None or not 1 <= input_ids.size(0) <= self.rows:
             return False
         mode = forward_batch.forward_mode
         if not (mode.is_decode() if self.k1 else mode.is_target_verify()):
@@ -365,32 +367,38 @@ class MonoDecode:
         s = core.size(0)
         out = torch.empty_like(residual)
         res_out = torch.empty_like(residual)
-        k2.layer_post(
-            k2.K2Build(
-                tokens=s,
-                eps=layer.post_attention_layernorm.variance_epsilon,
-                fse=self.fse,
-                oq=oq,
-            ),
-            core=core,
-            residual=residual,
-            w_o=o.weight,
-            w_os=o.weight_scale if oq else None,
-            ln_w=layer.post_attention_layernorm.weight,
-            w_gate=mlp.gate.weight,
-            w_sg=mlp.shared_expert_gate.weight,
-            w_sgu=None if se is None else se.gate_up_proj.weight,
-            w_sd=None if se is None else se.down_proj.weight,
-            w13=ex.w13_weight,
-            w13s=ex.w13_weight_scale,
-            w2=ex.w2_weight,
-            w2s=ex.w2_weight_scale,
-            out=out,
-            res_out=res_out,
-            scratch=self.k2_scratch[s],
-            peers=self.peers.addresses,
-            rank=self.rank,
-            epoch=self.epoch,
-            layer=k2.TAG_SLOTS // 2 + i,
-        )
+        # Rows past MAX_TOKENS (verify steps only) take a second launch. It
+        # needs its own tag in the step, so it takes K1's slot, unused there.
+        for r0, slot in ((0, k2.TAG_SLOTS // 2 + i), (L.MAX_TOKENS, i)):
+            if r0 >= s:
+                break
+            r = slice(r0, min(s, r0 + L.MAX_TOKENS))
+            k2.layer_post(
+                k2.K2Build(
+                    tokens=r.stop - r0,
+                    eps=layer.post_attention_layernorm.variance_epsilon,
+                    fse=self.fse,
+                    oq=oq,
+                ),
+                core=core[r],
+                residual=residual[r],
+                w_o=o.weight,
+                w_os=o.weight_scale if oq else None,
+                ln_w=layer.post_attention_layernorm.weight,
+                w_gate=mlp.gate.weight,
+                w_sg=mlp.shared_expert_gate.weight,
+                w_sgu=None if se is None else se.gate_up_proj.weight,
+                w_sd=None if se is None else se.down_proj.weight,
+                w13=ex.w13_weight,
+                w13s=ex.w13_weight_scale,
+                w2=ex.w2_weight,
+                w2s=ex.w2_weight_scale,
+                out=out[r],
+                res_out=res_out[r],
+                scratch=self.k2_scratch[r.stop - r0],
+                peers=self.peers.addresses,
+                rank=self.rank,
+                epoch=self.epoch,
+                layer=slot,
+            )
         return out, res_out

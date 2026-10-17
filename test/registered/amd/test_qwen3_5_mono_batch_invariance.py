@@ -280,12 +280,40 @@ def _worker_k2(rank, port, results, fse):
             outs[(s, pos, kind)] = (out[pos], res_out[pos])
         ref = outs[(1, 0, "rand0")][0]
         with_others, with_width = _diffs(outs)
+        # The glue's verify step of 2 x MAX_TOKENS rows: two launches in one
+        # epoch, the second on K1's tag slot 0. The probe is rows 0 and 8.
+        n = 2 * MAX_TOKENS
+        g.manual_seed(1)
+        residual = rnd(n, HIDDEN)
+        g.manual_seed(1000 * rank + 1)
+        core = rnd(n, CORE)
+        residual[0::MAX_TOKENS], core[0::MAX_TOKENS] = probe_r, probe_c
+        out = torch.empty(n, HIDDEN, dtype=BF, device=dev)
+        res_out = torch.empty_like(out)
+        epoch.add_(1)
+        for r0, slot in ((0, k2.TAG_SLOTS // 2), (MAX_TOKENS, 0)):
+            r = slice(r0, r0 + MAX_TOKENS)
+            k2.layer_post(
+                k2.K2Build(tokens=MAX_TOKENS, fse=fse),
+                core=core[r],
+                residual=residual[r],
+                **w,
+                out=out[r],
+                res_out=res_out[r],
+                scratch=scratch[MAX_TOKENS],
+                peers=peers.addresses,
+                rank=rank,
+                epoch=epoch,
+                layer=slot,
+            )
+        torch.cuda.synchronize()
         results[rank] = {
             "error": "",
             "finite": bool(torch.isfinite(ref).all()),
             "nonzero": bool(ref.abs().sum() > 0),
             "with_others": with_others,
             "with_width": with_width,
+            "split": [i for i in (0, MAX_TOKENS) if not torch.equal(out[i], ref)],
         }
     except Exception as error:  # surfaced by the parent as a test failure
         import traceback
@@ -323,6 +351,9 @@ class K2Test(CustomTestCase):
             )
             self.assertEqual(
                 r["with_width"], [], f"rank {rank}: the probe changes with the width"
+            )
+            self.assertEqual(
+                r["split"], [], f"rank {rank}: the probe changes in a two-launch step"
             )
 
 
