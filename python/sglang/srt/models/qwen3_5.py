@@ -17,6 +17,7 @@
 import logging
 import os
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -164,7 +165,9 @@ _gdn_decode_fused_proj_conv = (
 _gdn_online_mxfp4 = tuple(
     p for p in envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get().split(",") if p
 )
-assert set(_gdn_online_mxfp4) <= {"in_proj_qkvz", "out_proj"}, _gdn_online_mxfp4
+assert set(_gdn_online_mxfp4) <= {"in_proj_qkvz", "in_proj_ba", "out_proj"}, _gdn_online_mxfp4
+# in_proj_ba is quantized only inside the in_proj_qkvz MXFP4 weight.
+assert "in_proj_ba" not in _gdn_online_mxfp4 or "in_proj_qkvz" in _gdn_online_mxfp4
 if _gdn_online_mxfp4 and not (_use_aiter and _is_gfx95):
     logger.warning("SGLANG_ROCM_GDN_ONLINE_MXFP4 needs gfx95x and SGLANG_USE_AITER=1")
     _gdn_online_mxfp4 = ()
@@ -378,6 +381,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self._fused_in_proj_ba_width = 0
         self._fused_in_proj_scale: Optional[torch.Tensor] = None
         self._fused_in_proj_sources = None
+        self._mxfp4_in_proj: Optional[SimpleNamespace] = None
         self._derived_weight_cache_error = None
         self._fused_input_proj_cpu_enabled = LazyValue(
             lambda: (
@@ -643,13 +647,37 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             AiterMxfp4OnlineLinearMethod,
         )
 
-        done = 0
-        for name in _gdn_online_mxfp4:
-            proj = getattr(self, name)
-            if (
+        def is_bf16(proj):
+            return (
                 isinstance(proj.quant_method, UnquantizedLinearMethod)
                 and proj.weight.dtype == torch.bfloat16
-            ):
+            )
+
+        qkvz, ba = self.in_proj_qkvz, self.in_proj_ba
+        done = 0
+        if "in_proj_ba" in _gdn_online_mxfp4 and is_bf16(qkvz) and is_bf16(ba):
+            # One MXFP4 GEMM for both up to PRESHUFFLE_MAX_M rows. The shuffles
+            # are local to 16 / 32 rows, so in_proj_qkvz is the packed head; the
+            # monokernel and larger batches read it there, with in_proj_ba in
+            # BF16. A namespace keeps the packed weight out of the parameters.
+            width = qkvz.weight.shape[0]
+            packed = SimpleNamespace(weight=torch.cat([qkvz.weight.data, ba.weight.data]))
+            AiterMxfp4OnlineLinearMethod.quantize_(packed, config_n=width)
+            if packed.mxfp4_preshuffle_tuned:
+                qkvz.weight = torch.nn.Parameter(
+                    packed.weight[:width], requires_grad=False
+                )
+                qkvz.weight_scale = torch.nn.Parameter(
+                    packed.weight_scale[:width], requires_grad=False
+                )
+                qkvz.mxfp4_config_n = None
+                qkvz.mxfp4_preshuffle_tuned = True
+                qkvz.quant_method = AiterMxfp4OnlineLinearMethod()
+                self._mxfp4_in_proj = packed
+                done += 2
+        for name in _gdn_online_mxfp4:
+            proj = getattr(self, name)
+            if name != "in_proj_ba" and is_bf16(proj):
                 AiterMxfp4OnlineLinearMethod.quantize_(proj)
                 done += 1
         return done
@@ -772,6 +800,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if self._mxfp4_in_proj is not None:
+            x = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+            if 0 < x.shape[0] <= self._mxfp4_in_proj.quant_method.PRESHUFFLE_MAX_M:
+                y = self._mxfp4_in_proj.quant_method.apply(self._mxfp4_in_proj, x)
+                split = self.in_proj_qkvz.weight.shape[0]
+                return y[:, :split], y[:, split:]
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate

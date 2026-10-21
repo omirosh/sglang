@@ -778,7 +778,11 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
     PRESHUFFLE_MAX_M = 64
 
     @classmethod
-    def quantize_(cls, layer: torch.nn.Module) -> None:
+    def quantize_(cls, layer: torch.nn.Module, config_n: Optional[int] = None) -> None:
+        """``config_n`` takes the Triton config of another N, for a weight that
+        packs a tuned shape with a few extra rows. Such a layer runs only the
+        Triton path, so ``apply`` must not get more than ``PRESHUFFLE_MAX_M`` rows.
+        """
         from aiter.ops.shuffle import shuffle_scale, shuffle_weight
         from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
             _get_config,
@@ -787,9 +791,8 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         w = layer.weight.data
         n, k = w.shape
         # gemm_a4w4 and the preshuffled scales read whole 256x256 tiles.
-        assert w.dtype == torch.bfloat16 and n % 256 == 0 and k % 256 == 0, (
-            f"online MXFP4 needs a BF16 weight with N, K % 256 == 0, got {w.dtype} {n}x{k}"
-        )
+        assert w.dtype == torch.bfloat16 and k % 256 == 0, (w.dtype, n, k)
+        assert n % 256 == 0 if config_n is None else n % 32 == 0, (n, config_n)
         w_q, w_s = _dynamic_mxfp4_quant_orig(w)
         layer.weight = torch.nn.Parameter(
             shuffle_weight(w_q.view(torch.uint8), layout=(16, 16)),
@@ -798,8 +801,9 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         layer.weight_scale = torch.nn.Parameter(
             shuffle_scale(w_s.view(torch.uint8)), requires_grad=False
         )
+        layer.mxfp4_config_n = config_n
         layer.mxfp4_preshuffle_tuned = _get_config(
-            cls.PRESHUFFLE_MAX_M, n, k // 2, True
+            cls.PRESHUFFLE_MAX_M, config_n or n, k // 2, True
         )[1]
         layer.quant_method = cls()
 
@@ -813,10 +817,20 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from aiter import gemm_a4w4, per_1x32_f4_quant_hip
+        from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
+            _get_config,
+        )
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
 
         m, n = x.shape[0], layer.weight.shape[0]
         w_s = layer.weight_scale
+        config = None
+        if layer.mxfp4_config_n is not None:
+            assert m <= self.PRESHUFFLE_MAX_M and layer.mxfp4_preshuffle_tuned, m
+            # Without it, AITER takes its untuned default for this N (2.5x slower).
+            config = dict(
+                _get_config(m, layer.mxfp4_config_n, x.shape[1] // 2, True)[0]
+            )
         if m <= self.PRESHUFFLE_MAX_M and layer.mxfp4_preshuffle_tuned:
             # Below 32 rows the kernel takes un-shuffled activation scales.
             x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=m >= 32)
@@ -830,6 +844,7 @@ class AiterMxfp4OnlineLinearMethod(LinearMethodBase):
                 w_s.view(w_s.shape[0] // 32, -1),
                 x.dtype,
                 y,
+                config=config,
             )
         else:
             x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=True)

@@ -54,6 +54,47 @@ class TestQwen35GdnOnlineMxfp4(CustomTestCase):
                 rel = ((y.float() - ref).norm() / ref.norm()).item()
                 self.assertLess(rel, 1e-2)
 
+    def test_packed_qkvz_ba(self):
+        from types import SimpleNamespace
+
+        from aiter import per_1x32_f4_quant_hip
+
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            AiterMxfp4OnlineLinearMethod,
+            _dequant_mxfp4_to_bf16,
+            _dynamic_mxfp4_quant_orig,
+        )
+
+        (n, k), ba = SHAPES[0], 32
+        torch.manual_seed(0)
+        w = torch.randn(n + ba, k, device="cuda", dtype=torch.bfloat16) * 0.02
+        packed = SimpleNamespace(weight=w)
+        AiterMxfp4OnlineLinearMethod.quantize_(packed, config_n=n)
+        self.assertTrue(packed.mxfp4_preshuffle_tuned)
+        # The model reads in_proj_qkvz from the head of the packed weight.
+        qkvz = torch.nn.Module()
+        qkvz.weight = torch.nn.Parameter(w[:n].clone(), requires_grad=False)
+        AiterMxfp4OnlineLinearMethod.quantize_(qkvz)
+        self.assertTrue(torch.equal(packed.weight[:n], qkvz.weight))
+        self.assertTrue(torch.equal(packed.weight_scale[:n], qkvz.weight_scale))
+
+        w_q, w_s = _dynamic_mxfp4_quant_orig(w)
+        w_ref = _dequant_mxfp4_to_bf16(w_q, w_s.contiguous()).float()
+        for m in (1, 4, 16, 31, 32, 64):
+            with self.subTest(m=m):
+                x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=False)
+                ref = torch.nn.functional.linear(
+                    _dequant_mxfp4_to_bf16(
+                        x_q.view(torch.uint8), x_s.view(torch.uint8)[:m]
+                    ).float(),
+                    w_ref,
+                )
+                y = packed.quant_method.apply(packed, x)
+                self.assertEqual(y.shape, (m, n + ba))
+                rel = ((y.float() - ref).norm() / ref.norm()).item()
+                self.assertLess(rel, 1e-2)
+
 
 if __name__ == "__main__":
     unittest.main()
