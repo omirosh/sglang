@@ -225,6 +225,26 @@ class ForwardMetadata:
     cprr_kv_indices: Optional[torch.Tensor] = None
     cprr_kv_indptr: Optional[torch.Tensor] = None
     cprr_empty_rows: Optional[torch.Tensor] = None
+    # FlyDSL NHD decode: int32 context lengths and the GPU work plan built
+    # from them (aiter PADecodePlan), shared by every layer of the step.
+    flydsl_seq_lens: Optional[torch.Tensor] = None
+    flydsl_plan: Optional[object] = None
+
+
+def _load_flydsl_pa_decode():
+    """aiter's FlyDSL pa_decode module if it has the NHD layout (aiter#5949)."""
+    import importlib
+
+    # aiter.ops.flydsl_pa5949 is a private copy of aiter#5949 next to an older
+    # aiter.ops.flydsl, for images whose aiter predates the PR.
+    for name in ("aiter.ops.flydsl.pa_decode", "aiter.ops.flydsl_pa5949.pa_decode"):
+        try:
+            mod = importlib.import_module(name)
+        except ImportError:
+            continue
+        if hasattr(mod, "pa_decode_nhd_supported"):
+            return mod
+    return None
 
 
 def _build_paged_kv_view(
@@ -558,6 +578,11 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+
+        self.flydsl_pa_decode = self._init_flydsl_pa_decode()
+        self._flydsl_plans = {}
+        self._flydsl_graph_seq_lens: Optional[torch.Tensor] = None
+        self._flydsl_logged = False
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -1971,6 +1996,89 @@ class AiterAttnBackend(AttentionBackend):
                 final_lse = final_lse[:, : layer.tp_q_head_num].contiguous()
         return output, final_lse
 
+    def _init_flydsl_pa_decode(self):
+        """The FlyDSL pa_decode module if SGLANG_AITER_FLYDSL_PA_DECODE=1 and
+        it can serve this model's decode, else None."""
+        if not get_bool_env_var("SGLANG_AITER_FLYDSL_PA_DECODE"):
+            return None
+        mod = _load_flydsl_pa_decode()
+        requirements = {
+            "an aiter with aiter#5949 (FlyDSL NHD pa_decode)": mod is not None,
+            "SGLANG_USE_AITER_UNIFIED_ATTN=1": self.use_triton_unified_attention,
+            "no MLA, sliding-window pool or 5D KV layout": not (
+                self.use_mla
+                or self.use_sliding_window_kv_pool
+                or self.kv_cache_is_vectorized_5d
+            ),
+            "gfx950, an FP8 KV cache, head size 256 and page size 64": (
+                mod is not None
+                and is_gfx95_supported()
+                and mod.pa_decode_nhd_supported(
+                    architecture=torch.cuda.get_device_properties(
+                        self.device
+                    ).gcnArchName,
+                    kv_dtype=self.kv_cache_dtype,
+                    head_dim=self.head_dim,
+                    block_size=self.page_size,
+                    query_length=1,
+                    query_group_size=self.num_head // max(1, self.num_kv_head),
+                )
+            ),
+        }
+        missing = [req for req, ok in requirements.items() if not ok]
+        if missing:
+            logger.warning(
+                "SGLANG_AITER_FLYDSL_PA_DECODE=1 is ignored: it needs %s.",
+                ", ".join(missing),
+            )
+            return None
+        logger.info(
+            "[flydsl-pa-decode] FlyDSL NHD paged-attention decode active "
+            "(%s, page %d, %d query heads / %d KV heads).",
+            mod.__name__,
+            self.page_size,
+            self.num_head,
+            self.num_kv_head,
+        )
+        return mod
+
+    def _flydsl_decode_plan(
+        self,
+        seq_lens: torch.Tensor,
+        bs: int,
+        seq_lens_buf: Optional[torch.Tensor] = None,
+    ):
+        """int32 context lengths and the work plan of a plain decode batch.
+
+        One plan per batch size, refreshed in place on the current stream (no
+        host readback), so a captured graph keeps reading the same buffers.
+        With seq_lens_buf (a static graph buffer) the lengths go there.
+        """
+        if seq_lens_buf is None:
+            lens = seq_lens[:bs].to(torch.int32)
+        else:
+            lens = seq_lens_buf[:bs]
+            lens.copy_(seq_lens[:bs])
+        mod = self.flydsl_pa_decode
+        plan = self._flydsl_plans.get(bs)
+        if plan is None:
+            budget = mod.pa_decode_default_workgroup_budget(
+                architecture=torch.cuda.get_device_properties(self.device).gcnArchName,
+                num_compute_units=torch.cuda.get_device_properties(
+                    self.device
+                ).multi_processor_count,
+                kv_dtype=self.kv_cache_dtype,
+                head_dim=self.head_dim,
+                block_size=self.page_size,
+                query_length=1,
+                query_group_size=self.num_head // max(1, self.num_kv_head),
+            )
+            plan = mod.plan_pa_decode(lens, self.num_kv_head, workgroup_budget=budget)
+            self._flydsl_plans[bs] = plan
+        else:
+            mod.plan_pa_decode(lens, self.num_kv_head, plan=plan)
+        return lens, plan
+
     def _kv_index_blocks(self, bs: int) -> int:
         if self.max_context_len < _KV_INDEX_BLOCKS_MIN_CONTEXT:
             return 1
@@ -2017,6 +2125,18 @@ class AiterAttnBackend(AttentionBackend):
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
             ]
+
+        if (
+            self.flydsl_pa_decode is not None
+            and forward_batch.forward_mode.is_decode()
+            and forward_batch.spec_info is None
+        ):
+            fm = self.forward_metadata
+            fm.flydsl_seq_lens, fm.flydsl_plan = self._flydsl_decode_plan(
+                forward_batch.seq_lens,
+                forward_batch.batch_size,
+                self._flydsl_graph_seq_lens,
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
@@ -2197,6 +2317,15 @@ class AiterAttnBackend(AttentionBackend):
                 swa_page_table=swa_page_table,
                 swa_out_cache_loc=swa_out_cache_loc,
             )
+            if (
+                self.flydsl_pa_decode is not None
+                and spec_info is None
+                and forward_batch.forward_mode.is_decode()
+            ):
+                fm = self.forward_metadata
+                fm.flydsl_seq_lens, fm.flydsl_plan = self._flydsl_decode_plan(
+                    forward_batch.seq_lens, bs
+                )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
             # EAGLE V2: DRAFT_EXTEND_V2 mode - extend draft KV cache with all predicted tokens
@@ -2836,6 +2965,10 @@ class AiterAttnBackend(AttentionBackend):
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
                 device=self.device,
+            )
+        if self.flydsl_pa_decode is not None:
+            self._flydsl_graph_seq_lens = torch.ones(
+                max_bs, dtype=torch.int32, device=self.device
             )
 
         if not self.skip_prefill:
@@ -4789,6 +4922,41 @@ class AiterAttnBackend(AttentionBackend):
                         page_table = self.forward_metadata.swa_page_table
 
                 max_kv_len = page_table.shape[1] * self.page_size
+                fm = self.forward_metadata
+                if (
+                    fm.flydsl_plan is not None
+                    and window_size == (-1, -1)
+                    and sinks is None
+                    and self.logits_soft_cap == 0.0
+                    and layer.qk_head_dim == layer.v_head_dim == self.head_dim
+                    and layer.tp_q_head_num == self.num_head
+                    and layer.tp_k_head_num == layer.tp_v_head_num == self.num_kv_head
+                ):
+                    self.flydsl_pa_decode.pa_decode(
+                        o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                        q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        ),
+                        fm.flydsl_seq_lens,
+                        page_table[:bs],
+                        layer.scaling,
+                        1,
+                        key_scale=k_descale,
+                        value_scale=v_descale,
+                        work_plan=fm.flydsl_plan,
+                    )
+                    if not self._flydsl_logged:
+                        self._flydsl_logged = True
+                        logger.info(
+                            "[flydsl-pa-decode] first FlyDSL decode call: bs=%d layer=%d",
+                            bs,
+                            layer.layer_id,
+                        )
+                    return o
                 # q_len==1 decode (incl. EAGLE draft decode steps) via the asm
                 # verify kernel (in-kernel tail alignment; static shapes, so
                 # the path is cuda-graph capture safe). Must run BEFORE the
