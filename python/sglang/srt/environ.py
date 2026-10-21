@@ -984,6 +984,9 @@ class Envs:
     # "out_proj") to quantize to MXFP4 after loading. Needs gfx95x and
     # SGLANG_USE_AITER=1.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvStr("")
+    # Rotate those projections by a 32-wide block Hadamard matrix before MXFP4.
+    # Needs AITER with aiter#6734.
+    SGLANG_ROCM_GDN_ONLINE_MXFP4_HADAMARD = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("auto")
