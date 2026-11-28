@@ -258,6 +258,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         if query.shape[0] == 0:
             return query, key
         self._match_cos_sin_cache_dtype(query)
+        if positions.ndim == 1 and self.mrope_section:
+            # Text positions (an MTP draft's): the same position on each axis gives
+            # the native rotation; the kernel reads a token stride of 1.
+            positions = positions.contiguous().expand(3, -1)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)

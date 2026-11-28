@@ -132,6 +132,18 @@ class TestMRopeAxisMap(CustomTestCase):
         torch.testing.assert_close(got_key, want_key, atol=0, rtol=0)
         self.assertFalse(torch.equal(got_query, query))
 
+    def test_cuda_dispatch_runs_text_positions_on_the_fused_kernel(self):
+        # An MTP draft passes 1-D positions; the fused kernel reads them on each
+        # axis, with a token stride of 1 (here from a strided tensor)
+        rope = build_mrope([11, 11, 10], 64, interleaved=True)
+        positions = torch.arange(4)[::2]
+        query, key = torch.randn(2, 64), torch.randn(2, 64)
+        with patch.object(mrope, "triton_mrope_fused") as fused:
+            rope.forward_cuda(positions, query, key)
+        got = fused.call_args.args[3]
+        self.assertEqual((tuple(got.shape), got.stride()), ((3, 2), (0, 1)))
+        self.assertTrue(all(torch.equal(axis, positions) for axis in got))
+
     def test_npu_dispatch_preserves_multimodal_positions(self):
         # The fused CANN op does only 1-D plain RoPE; 3-axis positions that
         # reach it lose the height and width axes.
